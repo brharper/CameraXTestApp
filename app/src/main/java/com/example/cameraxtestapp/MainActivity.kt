@@ -99,14 +99,15 @@ class RecorderViewModel(
     private val mRecordState: MutableStateFlow<Boolean> = MutableStateFlow(false)
     val recordState: StateFlow<Boolean> = mRecordState
 
-    lateinit var currentRecording: Recording
+    private var useCasesBound = false
+    private lateinit var currentRecording: Recording
+    private lateinit var preview: Preview
+    private lateinit var videoCapture: VideoCapture<Recorder>
+    private lateinit var recorder: Recorder
+    private lateinit var contentValues: ContentValues
+    private lateinit var mediaStoreOutputOptions: MediaStoreOutputOptions
 
-//    Set externally by composable
-    var videoCapture: VideoCapture<Recorder>? = null
-    var recorder: Recorder? = null
-//
-
-    val qualitySelector = QualitySelector.fromOrderedList(
+    private val qualitySelector = QualitySelector.fromOrderedList(
         listOf(Quality.UHD, Quality.FHD, Quality.HD, Quality.SD),
         FallbackStrategy.lowerQualityOrHigherThan(Quality.SD))
 
@@ -119,6 +120,7 @@ class RecorderViewModel(
             }
             is VideoRecordEvent.Pause -> {
                 Log.d(TAG, "VideoRecordEvent.Pause")
+                mRecordState.value = false
             }
             is VideoRecordEvent.Status -> {
                 Log.d(TAG, "VideoRecordEvent.Status: \n$recordEvent")
@@ -138,75 +140,62 @@ class RecorderViewModel(
 
 
     fun bindPreviewAndRecorder(
-        cameraExecutor: Executor,
         viewModel: RecorderViewModel,
         cameraProvider: ProcessCameraProvider,
         lifecycleOwner: LifecycleOwner,
         cameraSelector: CameraSelector,
         previewView: PreviewView,
-        qualitySelector: QualitySelector = QualitySelector.fromOrderedList(
-            listOf(Quality.UHD, Quality.FHD, Quality.HD, Quality.SD),
-            FallbackStrategy.lowerQualityOrHigherThan(Quality.SD))
     ) {
 
-        Log.d(TAG, "Binding camera preview and recorder") // ToDo: Remove
-
-        val preview = Preview.Builder().build()
+        Log.d(TAG, "Binding camera preview and recorder")
+        preview = Preview.Builder().build()
         preview.setSurfaceProvider(previewView.surfaceProvider)
 
         // 2.1 Create a Recorder with QualitySelector.
-        viewModel.recorder = Recorder.Builder().build()
-//        .setExecutor(cameraExecutor)
-//        .setQualitySelector(qualitySelector)
-//        .build()
+        recorder = Recorder.Builder()
+            .setExecutor(cameraExecutor)
+            .setQualitySelector(qualitySelector)
+            .build()
 
-        viewModel.videoCapture = VideoCapture.withOutput(viewModel.recorder!!)
+        videoCapture = VideoCapture.withOutput(viewModel.recorder)
 
         // 1.1 Bind VideoCapture
-        cameraProvider.bindToLifecycle(lifecycleOwner, cameraSelector, preview, viewModel.videoCapture)
+        cameraProvider.bindToLifecycle(lifecycleOwner, cameraSelector, preview, videoCapture)
 
-
+        useCasesBound = true
     }
+
 
     @SuppressLint("MissingPermission")
     fun startRecording(
-        userLocale: Locale,
         startingContext: Context,
     ) {
 
-        if (videoCapture == null || recorder == null) {
+        if (useCasesBound) {
+            Log.d(TAG, "Starting recording...")
+
+            contentValues = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, "NEW_VIDEO")
+                put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
+            }
+
+            mediaStoreOutputOptions = MediaStoreOutputOptions
+                .Builder(
+                    startingContext.contentResolver, // Is this leaky?
+                    MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
+                .setContentValues(contentValues)
+                .build()
+
+            // 2.2 Configure the Recorder with one of the OutputOptions.
+            currentRecording = videoCapture.output
+                .prepareRecording(startingContext, mediaStoreOutputOptions)
+                .withAudioEnabled()  // 2.3 Enable audio with withAudioEnabled() if needed.
+                .start(cameraExecutor, recordEventListener) // 2.4 Call start() with a VideoRecordEvent listener to begin recording
+
+        } else { // Start Recording
             Log.d(TAG, "Cannot start recording without valid videoCapture and recorder instances.")
-            return
+
         }
-
-        Log.d(TAG, "Starting recording...")
-
-        val nameFormat = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", userLocale)
-        val startDateTimeFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", userLocale) // ToDo: User locale might impact ISO8601 format assumed by database
-        startDateTimeFormat.timeZone = TimeZone.getTimeZone("UTC")
-        val curTime = System.currentTimeMillis()
-        val tripName = "trip_" + nameFormat.format(curTime)
-        val fileName = "$tripName.mp4"
-        val videoMIMEType = "video/mp4"
-        val relativeVideoPath = "recordings/" // ToDo: Implement error handling for invalid directories
-
-        val contentValues = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, "NEW_VIDEO")
-            put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
-//            if (Build.VERSION.SDK_INT > Build.VERSION_CODES.P) {
-//                put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES)
-//            }
-        }
-        val mediaStoreOutputOptions = MediaStoreOutputOptions
-            .Builder(startingContext.contentResolver, MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
-            .setContentValues(contentValues)
-            .build()
-
-        // 2.2 Configure the Recorder with one of the OutputOptions.
-        currentRecording = videoCapture!!.output
-            .prepareRecording(startingContext, mediaStoreOutputOptions)
-            .withAudioEnabled()  // 2.3 Enable audio with withAudioEnabled() if needed.
-            .start(cameraExecutor, recordEventListener) // 2.4 Call start() with a VideoRecordEvent listener to begin recording
     }
 
 
@@ -298,13 +287,11 @@ fun VideoPreview(
             val bindOnFutureComplete = {
                 val cameraProvider = cameraProviderFuture.get()
                 viewModel.bindPreviewAndRecorder(
-                    cameraExecutor = viewModel.cameraExecutor,
                     viewModel = viewModel,
                     cameraProvider = cameraProvider,
                     lifecycleOwner = lifecycleOwner,
                     cameraSelector = cameraSelector,
-                    previewView = previewView,
-                    qualitySelector = viewModel.qualitySelector
+                    previewView = previewView
                 )
             }
             cameraProviderFuture.addListener(bindOnFutureComplete, cameraExecutor)
@@ -321,7 +308,6 @@ fun RecordVideoButton(
 ){
     Log.d(TAG, "Compose RecordVideoButton") // ToDo: Remove
     val localContext = LocalContext.current
-    val userLocale = LocalContext.current.resources.configuration.locales.get(0)
     val recordState = viewModel.recordState.collectAsState()
 
     IconButton(
@@ -330,10 +316,7 @@ fun RecordVideoButton(
             if (recordState.value) {
                 viewModel.stopRecording()
             } else {
-                viewModel.startRecording(
-                    userLocale = userLocale,
-                    startingContext = localContext
-                )
+                viewModel.startRecording(localContext)
             }
         },
         modifier = modifier.defaultMinSize(40.dp)
