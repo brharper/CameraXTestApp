@@ -7,7 +7,6 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
-import android.os.Environment
 import android.provider.MediaStore
 import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -33,6 +32,7 @@ import androidx.compose.material.IconButton
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.sharp.Lens
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.res.colorResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -45,6 +45,22 @@ import kotlinx.coroutines.flow.StateFlow
 import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.Executor
+
+/** From: https://developer.android.com/training/camerax/video-capture
+ *
+ * 1 To integrate the CameraX VideoCapture use case into your app, do the following:
+ * 1.1 Bind VideoCapture
+ * 1.2 Prepare and configure recording.
+ * 1.3 Start and control the runtime recording.
+ *
+ * 2 Interaction with Major Recording Objects
+ * 2.1 Create a Recorder with QualitySelector.
+ * 2.2 Configure the Recorder with one of the OutputOptions.
+ * 2.3 Enable audio with withAudioEnabled() if needed.
+ * 2.4 Call start() with a VideoRecordEvent listener to begin recording.
+ * 2.5 Use pause()/resume()/stop() on the Recording to control the recording.
+ * 2.6 Respond to VideoRecordEvents inside your event listener.
+ */
 
 @RequiresApi(Build.VERSION_CODES.P)
 class MainActivity : AppCompatActivity() {
@@ -83,13 +99,74 @@ class RecorderViewModel(
     private val mRecordState: MutableStateFlow<Boolean> = MutableStateFlow(false)
     val recordState: StateFlow<Boolean> = mRecordState
 
-    lateinit var recording: Recording
+    lateinit var currentRecording: Recording
 
+//    Set externally by composable
     var videoCapture: VideoCapture<Recorder>? = null
+    var recorder: Recorder? = null
+//
 
     val qualitySelector = QualitySelector.fromOrderedList(
         listOf(Quality.UHD, Quality.FHD, Quality.HD, Quality.SD),
         FallbackStrategy.lowerQualityOrHigherThan(Quality.SD))
+
+    private val recordEventListener = fun(recordEvent: VideoRecordEvent) {
+        // 2.6 Respond to VideoRecordEvents inside your event listener.
+        when (recordEvent) {
+            is VideoRecordEvent.Start -> {
+                Log.d(TAG, "VideoRecordEvent.Start")
+                mRecordState.value = true
+            }
+            is VideoRecordEvent.Pause -> {
+                Log.d(TAG, "VideoRecordEvent.Pause")
+            }
+            is VideoRecordEvent.Status -> {
+                Log.d(TAG, "VideoRecordEvent.Status: \n$recordEvent")
+            }
+            is VideoRecordEvent.Finalize -> {
+                mRecordState.value = false
+                if (!recordEvent.hasError()) {
+                    Log.d(TAG, "VideoRecordEvent.Finalize success with output URI: ${recordEvent.outputResults.outputUri}")
+                } else {
+                    currentRecording.close()
+                    Log.e(TAG, "Video capture ended with error: " +
+                            recordEventErrorToString(recordEvent.error))
+                }
+            }
+        }
+    }
+
+
+    fun bindPreviewAndRecorder(
+        cameraExecutor: Executor,
+        viewModel: RecorderViewModel,
+        cameraProvider: ProcessCameraProvider,
+        lifecycleOwner: LifecycleOwner,
+        cameraSelector: CameraSelector,
+        previewView: PreviewView,
+        qualitySelector: QualitySelector = QualitySelector.fromOrderedList(
+            listOf(Quality.UHD, Quality.FHD, Quality.HD, Quality.SD),
+            FallbackStrategy.lowerQualityOrHigherThan(Quality.SD))
+    ) {
+
+        Log.d(TAG, "Binding camera preview and recorder") // ToDo: Remove
+
+        val preview = Preview.Builder().build()
+        preview.setSurfaceProvider(previewView.surfaceProvider)
+
+        // 2.1 Create a Recorder with QualitySelector.
+        viewModel.recorder = Recorder.Builder().build()
+//        .setExecutor(cameraExecutor)
+//        .setQualitySelector(qualitySelector)
+//        .build()
+
+        viewModel.videoCapture = VideoCapture.withOutput(viewModel.recorder!!)
+
+        // 1.1 Bind VideoCapture
+        cameraProvider.bindToLifecycle(lifecycleOwner, cameraSelector, preview, viewModel.videoCapture)
+
+
+    }
 
     @SuppressLint("MissingPermission")
     fun startRecording(
@@ -97,8 +174,8 @@ class RecorderViewModel(
         startingContext: Context,
     ) {
 
-        if (videoCapture == null) {
-            Log.d(TAG, "Cannot start recording without videoCapture instance.")
+        if (videoCapture == null || recorder == null) {
+            Log.d(TAG, "Cannot start recording without valid videoCapture and recorder instances.")
             return
         }
 
@@ -114,43 +191,28 @@ class RecorderViewModel(
         val relativeVideoPath = "recordings/" // ToDo: Implement error handling for invalid directories
 
         val contentValues = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, tripName)
-            put(MediaStore.MediaColumns.MIME_TYPE, videoMIMEType)
-            if (Build.VERSION.SDK_INT > Build.VERSION_CODES.P) {
-                put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES)
-            }
+            put(MediaStore.MediaColumns.DISPLAY_NAME, "NEW_VIDEO")
+            put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
+//            if (Build.VERSION.SDK_INT > Build.VERSION_CODES.P) {
+//                put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES)
+//            }
         }
         val mediaStoreOutputOptions = MediaStoreOutputOptions
             .Builder(startingContext.contentResolver, MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
             .setContentValues(contentValues)
             .build()
 
-        recording = videoCapture!!.output
+        // 2.2 Configure the Recorder with one of the OutputOptions.
+        currentRecording = videoCapture!!.output
             .prepareRecording(startingContext, mediaStoreOutputOptions)
-            .apply { withAudioEnabled() }
-            .start(cameraExecutor) { recordEvent ->
-                when (recordEvent) {
-                    is VideoRecordEvent.Start -> {
-                        Log.d(TAG, "VideoRecordEvent.Start")
-                        mRecordState.value = true
-                    }
-                    is VideoRecordEvent.Finalize -> {
-                        mRecordState.value = false
-                        if (!recordEvent.hasError()) {
-                            Log.d(TAG, "VideoRecordEvent.Finalize success with output URI: ${recordEvent.outputResults.outputUri}")
-                        } else {
-                            recording.close()
-                            Log.e(TAG, "Video capture ended with error: " +
-                                    recordEventErrorToString(recordEvent.error))
-                        }
-                    }
-                }
-            }
+            .withAudioEnabled()  // 2.3 Enable audio with withAudioEnabled() if needed.
+            .start(cameraExecutor, recordEventListener) // 2.4 Call start() with a VideoRecordEvent listener to begin recording
     }
+
 
     fun stopRecording() {
         Log.d(TAG, "Stopping recording.")
-        recording.stop()
+        currentRecording.stop() // 2.5 Use pause()/resume()/stop() on the Recording to control the recording.
         mRecordState.value = false // ToDo: Might be redundant
     }
 
@@ -196,16 +258,25 @@ fun CreateApp(viewModel: RecorderViewModel){
         permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
     }
 
-    Box {
-        VideoPreview(viewModel)
-        RecordVideoButton(viewModel)
-    }
 
+    Box(){
+
+        VideoPreview(
+            modifier = Modifier
+                .fillMaxSize()
+                .align(Alignment.TopCenter),
+            viewModel = viewModel)
+
+        RecordVideoButton(
+            modifier = Modifier.align(Alignment.BottomCenter),
+            viewModel = viewModel)
+    }
 
 }
 
 @Composable
 fun VideoPreview(
+    modifier: Modifier = Modifier,
     viewModel: RecorderViewModel
 ){
 
@@ -226,53 +297,26 @@ fun VideoPreview(
             val cameraExecutor = ContextCompat.getMainExecutor(context)
             val bindOnFutureComplete = {
                 val cameraProvider = cameraProviderFuture.get()
-                viewModel.videoCapture = bindPreviewAndRecorder(
+                viewModel.bindPreviewAndRecorder(
                     cameraExecutor = viewModel.cameraExecutor,
+                    viewModel = viewModel,
                     cameraProvider = cameraProvider,
                     lifecycleOwner = lifecycleOwner,
                     cameraSelector = cameraSelector,
-                    previewView = previewView
+                    previewView = previewView,
+                    qualitySelector = viewModel.qualitySelector
                 )
             }
             cameraProviderFuture.addListener(bindOnFutureComplete, cameraExecutor)
             previewView },
-        modifier = Modifier
-            .fillMaxSize())
-
+        modifier = modifier)
 
 }
 
-private fun bindPreviewAndRecorder(
-    cameraExecutor: Executor,
-    cameraProvider: ProcessCameraProvider,
-    lifecycleOwner: LifecycleOwner,
-    cameraSelector: CameraSelector,
-    previewView: PreviewView,
-    qualitySelector: QualitySelector = QualitySelector.fromOrderedList(
-        listOf(Quality.UHD, Quality.FHD, Quality.HD, Quality.SD),
-        FallbackStrategy.lowerQualityOrHigherThan(Quality.SD))
-): VideoCapture<Recorder> {
-
-    Log.d(TAG, "Binding camera preview and recorder") // ToDo: Remove
-
-    val preview = Preview.Builder().build()
-    preview.setSurfaceProvider(previewView.surfaceProvider)
-
-    val recorder = Recorder.Builder()
-        .setExecutor(cameraExecutor)
-        .setQualitySelector(qualitySelector)
-        .build()
-
-    val videoCapture = VideoCapture.withOutput(recorder)
-
-    cameraProvider.bindToLifecycle(lifecycleOwner, cameraSelector, preview, videoCapture)
-
-    return videoCapture
-
-}
 
 @Composable
 fun RecordVideoButton(
+    modifier: Modifier = Modifier,
     viewModel: RecorderViewModel
 ){
     Log.d(TAG, "Compose RecordVideoButton") // ToDo: Remove
@@ -292,7 +336,7 @@ fun RecordVideoButton(
                 )
             }
         },
-        modifier = Modifier.defaultMinSize(40.dp)
+        modifier = modifier.defaultMinSize(40.dp)
     ) {
         Icon(
             imageVector = Icons.Sharp.Lens,
